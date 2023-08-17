@@ -31,7 +31,7 @@ scheduler_config = SchedulerConfig(max_num_batched_tokens=512, max_num_seqs=2, m
 sampling_params = SamplingParams(temperature=0, max_tokens=512)
 llm = LLM(model=model, tokenizer=tokenizer, scheduler_config=scheduler_config, log_stats=False)
 
-prompt=["God is a girl", "Hello World"]
+prompt=["God is a girl"]
 outputs = llm.generate(prompt, sampling_params, use_tqdm=False)
 
 for output in outputs:

@@ -1,5 +1,9 @@
+from typing import Optional, Tuple, Union
 from vllm.model_executor.input_metadata import InputMetadata
+import torch
+from torch import nn
 
+from .activations import ACT2FN
 
 class Conv1D(nn.Module):
     """
@@ -38,7 +42,6 @@ class GPT2Attention(nn.Module):
                 1, max_positions, max_positions
             ),
         )
-        self.register_buffer("masked_bias", torch.tensor(-1e4))
 
         self.embed_dim = config.hidden_size
         self.num_heads = config.num_attention_heads
@@ -51,164 +54,92 @@ class GPT2Attention(nn.Module):
             )
 
         self.scale_attn_weights = config.scale_attn_weights
-        self.is_cross_attention = is_cross_attention
 
         # Layer-wise attention scaling, reordering, and upcasting
         self.scale_attn_by_inverse_layer_idx = config.scale_attn_by_inverse_layer_idx
         self.layer_idx = layer_idx
-        self.reorder_and_upcast_attn = config.reorder_and_upcast_attn
 
-        if self.is_cross_attention:
-            self.c_attn = Conv1D(2 * self.embed_dim, self.embed_dim)
-            self.q_attn = Conv1D(self.embed_dim, self.embed_dim)
-        else:
-            self.c_attn = Conv1D(3 * self.embed_dim, self.embed_dim)
+        self.c_attn = Conv1D(3 * self.embed_dim, self.embed_dim)
         self.c_proj = Conv1D(self.embed_dim, self.embed_dim)
 
-        self.attn_dropout = nn.Dropout(config.attn_pdrop)
-        self.resid_dropout = nn.Dropout(config.resid_pdrop)
+    def _attn(self, query, key, value, attention_mask=None):
+        #q,k,v (head, num_tokens, head_dim)
+        attn_weights = torch.matmul(query, key.transpose(-1, -2))
 
-        self.pruned_heads = set()
+        if self.scale_attn_weights:
+            attn_weights = attn_weights / torch.tensor(
+                value.size(-1) ** 0.5, dtype=attn_weights.dtype, device=attn_weights.device
+            )
 
-    def single_query_cached_kv_attention(
-        self,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        input_metadata: InputMetadata,
-    ):
-        attn_outputs = ()
-        for i in len(input_metadata.num_generation_tokens):
-            attn_weights = torch.matmul(query[i:i+1], key[i:i+1].transpose(-1, -2))
+        # Layer-wise attention scaling
+        if self.scale_attn_by_inverse_layer_idx:
+            attn_weights = attn_weights / float(self.layer_idx + 1)
 
-            if self.scale_attn_weights:
-                attn_weights = attn_weights / torch.tensor(
-                    value.size(-1) ** 0.5, dtype=attn_weights.dtype, device=attn_weights.device
-                )
 
-            if not self.is_cross_attention:
-                causal_mask = self.bias[0 : 1, :1].to(torch.bool)
-                # print(f"causal_mask: {causal_mask}")
-                mask_value = torch.finfo(attn_weights.dtype).min
-                # Need to be a tensor, otherwise we get error: `RuntimeError: expected scalar type float but found double`.
-                # Need to be on the same device, otherwise `RuntimeError: ..., x and y to be on the same device`
-                mask_value = torch.tensor(mask_value, dtype=attn_weights.dtype).to(attn_weights.device)
-                attn_weights = torch.where(causal_mask, attn_weights, mask_value)
+        # if only "normal" attention layer implements causal mask
+        query_length, key_length = query.size(-2), key.size(-2)
+        causal_mask = self.bias[:, key_length - query_length : key_length, :key_length].to(torch.bool)
+        # print(f"causal_mask: {causal_mask}")
+        mask_value = torch.finfo(attn_weights.dtype).min
+        # Need to be a tensor, otherwise we get error: `RuntimeError: expected scalar type float but found double`.
+        # Need to be on the same device, otherwise `RuntimeError: ..., x and y to be on the same device`
+        mask_value = torch.tensor(mask_value, dtype=attn_weights.dtype).to(attn_weights.device)
+        attn_weights = torch.where(causal_mask, attn_weights, mask_value)
 
-            attn_weights = nn.functional.softmax(attn_weights, dim=-1)
 
-            attn_output = torch.matmul(attn_weights, value[shift:input_metadata.prompt_lens[i]])
+        attn_weights = nn.functional.softmax(attn_weights, dim=-1)
 
-            attn_outputs.append(attn_output)
-        
-        attn_output = torch.cat(attn_outputs, dim = -2) # (head, num_generation_tokens, head_dim)
+        attn_output = torch.matmul(attn_weights, value)
 
-    def multi_query_kv_attention(
-        self,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        input_metadata: InputMetadata,
-    ) -> torch.Tensor:
-        attn_outputs = ()
-        shift = 0
-        for i in len(input_metadata.num_prompts):
-            attn_weights = torch.matmul(query[shift:input_metadata.prompt_lens[i]], 
-                                        key[shift:input_metadata.prompt_lens[i]].transpose(-1, -2))
-            shift = input_metadata.prompt_lens[i]
-
-            if self.scale_attn_weights:
-                attn_weights = attn_weights / torch.tensor(
-                    value.size(-1) ** 0.5, dtype=attn_weights.dtype, device=attn_weights.device
-                )
-
-            if not self.is_cross_attention:
-                query_length, key_length = query[shift:input_metadata.prompt_lens[i]].size(-2), \
-                                            key[shift:input_metadata.prompt_lens[i]].size(-2)
-                causal_mask = self.bias[:, key_length - query_length : key_length, :key_length].to(torch.bool)
-                # print(f"causal_mask: {causal_mask}")
-                mask_value = torch.finfo(attn_weights.dtype).min
-                # Need to be a tensor, otherwise we get error: `RuntimeError: expected scalar type float but found double`.
-                # Need to be on the same device, otherwise `RuntimeError: ..., x and y to be on the same device`
-                mask_value = torch.tensor(mask_value, dtype=attn_weights.dtype).to(attn_weights.device)
-                attn_weights = torch.where(causal_mask, attn_weights, mask_value)
-
-            attn_weights = nn.functional.softmax(attn_weights, dim=-1)
-
-            attn_output = torch.matmul(attn_weights, value[shift:input_metadata.prompt_lens[i]])
-
-            attn_outputs.append(attn_output)
-        
-        attn_output = torch.cat(attn_outputs, dim = -2) # (head, num_prompt_tokens, head_dim)
-
+        return attn_output
 
     def _split_heads(self, tensor, num_heads, attn_head_size):
         """
         Splits hidden_size dim into attn_head_size and num_heads
         """
-        new_shape = tensor.size()[:-1] + (num_heads, attn_head_size) #(token_num, head, head_features)
-        tensor = tensor.view(new_shape)
-        return tensor.permute(1, 0, 2)  # (head, token_num, head_features)
+        new_shape = tensor.size()[:-1] + (num_heads, attn_head_size)
+        tensor = tensor.view(new_shape) # (num_tokens, head, head_features)
+        return tensor.permute(1, 0, 2)  # (head, num_tokens, head_features)
 
     def _merge_heads(self, tensor, num_heads, attn_head_size):
         """
         Merges attn_head_size dim and num_attn_heads dim into hidden_size
         """
-        # tensor: (head, num_tokens, head_dim)
-        tensor = tensor.permute(1, 0, 2).contiguous()
+        # input: (head, num_tokens, head_dim)
+        tensor = tensor.permute(1, 0, 2).contiguous() # (num_tokens, head, head_dim)
         new_shape = tensor.size()[:-2] + (num_heads * attn_head_size,)
-        return tensor.view(new_shape) #(num_tokens, embed)
+        return tensor.view(new_shape) # (num_tokens, embed)
 
     def forward(
         self,
-        input_metadata : InputMetadata,
+        input_metadata: InputMetadata,
         hidden_states: Optional[Tuple[torch.FloatTensor]],
         layer_past: Optional[Tuple[torch.Tensor]] = None,
         attention_mask: Optional[torch.FloatTensor] = None,
-        use_cache: Optional[bool] = False,
-    ) -> Tuple[Union[torch.Tensor, Tuple[torch.Tensor]], ...]:
-        
-        query, key, value = self.c_attn(hidden_states).split(self.split_size, dim=-1) #(token_num, embed)
+    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        #q,k,v (num_tokens, embed)
+        query, key, value = self.c_attn(hidden_states).split(self.split_size, dim=-1)
 
-        query = self._split_heads(query, self.num_heads, self.head_dim) # (head, token_num, head_dim)
-        key = self._split_heads(key, self.num_heads, self.head_dim) # (head, token_num, head_dim)
-        value = self._split_heads(value, self.num_heads, self.head_dim) # (head, token_num, head_dim)
+        query = self._split_heads(query, self.num_heads, self.head_dim) # (head, num_tokens, head_dim)
+        key = self._split_heads(key, self.num_heads, self.head_dim) # (head, num_tokens, head_dim)
+        value = self._split_heads(value, self.num_heads, self.head_dim) # (head, num_tokens, head_dim)
 
         if layer_past is not None:
             past_key, past_value = layer_past
             key = torch.cat((past_key, key), dim=-2)
             value = torch.cat((past_value, value), dim=-2)
 
-        if use_cache is True:
-            present = (key, value)
-        else:
-            present = None
-        
-        # Compute the attention op for prompts.
-        num_prompt_tokens = input_metadata.num_prompt_tokens
-        if num_prompt_tokens > 0:
-            attn_output = self.multi_query_kv_attention(
-                            query[:num_prompt_tokens],
-                            key[:num_prompt_tokens],
-                            value[:num_prompt_tokens],
-                            input_metadata,
-                        )
 
-        num_valid_tokens = input_metadata.num_valid_tokens
-        # Compute the attention op for generation tokens.
-        if num_valid_tokens - num_prompt_tokens > 0:
-            attn_output= self.single_query_cached_kv_attention(
-                            output[num_prompt_tokens:num_valid_tokens],
-                            query[num_prompt_tokens:num_valid_tokens], key_cache,
-                            value_cache, input_metadata)
-                
+        cache_kv = (key, value)
+
+        attn_output = self._attn(query, key, value, attention_mask) # (head, num_tokens, head_dim)
+
         attn_output = self._merge_heads(attn_output, self.num_heads, self.head_dim)
         attn_output = self.c_proj(attn_output)
-        attn_output = self.resid_dropout(attn_output)
 
-        outputs = (attn_output, present)
+        outputs = (attn_output, cache_kv)
 
-        return outputs  # a, present, (attentions)
+        return outputs
 
 
 class GPT2MLP(nn.Module):
@@ -229,7 +160,6 @@ class GPT2MLP(nn.Module):
 
 
 class GPT2Block(nn.Module):
-
     def __init__(self, config, layer_idx=None):
         super().__init__()
         self.config = config
@@ -240,10 +170,6 @@ class GPT2Block(nn.Module):
         self.attn = GPT2Attention(config, layer_idx=layer_idx)
         self.ln_2 = nn.LayerNorm(hidden_size, eps=config.layer_norm_epsilon)
 
-        if config.add_cross_attention:
-            self.crossattention = GPT2Attention(config, is_cross_attention=True, layer_idx=layer_idx)
-            self.ln_cross_attn = nn.LayerNorm(hidden_size, eps=config.layer_norm_epsilon)
-
         self.mlp = GPT2MLP(inner_dim, config)
 
     def forward(
@@ -252,19 +178,17 @@ class GPT2Block(nn.Module):
         hidden_states: Optional[Tuple[torch.FloatTensor]],
         layer_past: Optional[Tuple[torch.Tensor]] = None,
         attention_mask: Optional[torch.FloatTensor] = None,
-        use_cache: Optional[bool] = False,
-    ) -> Union[Tuple[torch.Tensor], Optional[Tuple[torch.Tensor, Tuple[torch.FloatTensor, ...]]]]:
-        residual = hidden_states
-        hidden_states = self.ln_1(hidden_states) # (num_tokens, embed)
+    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        residual = hidden_states # (num_tokens, embed)
+        hidden_states = self.ln_1(hidden_states)
         attn_outputs = self.attn(
             input_metadata,
             hidden_states,
             layer_past=layer_past,
             attention_mask=attention_mask,
-            use_cache=use_cache,
         )
-        attn_output = attn_outputs[0]  # output_attn: a, present, (attentions)
-        outputs = attn_outputs[1:]
+        attn_output = attn_outputs[0] #(hidden_state, (cache_k, cache_v))
+        cache_kv = attn_outputs[1:]
         # residual connection
         hidden_states = attn_output + residual
 
@@ -274,12 +198,9 @@ class GPT2Block(nn.Module):
         # residual connection
         hidden_states = residual + feed_forward_hidden_states
 
-        if use_cache:
-            outputs = (hidden_states,) + outputs
-        else:
-            outputs = (hidden_states,) + outputs[1:]
+        outputs = (hidden_states,) + cache_kv
 
-        return outputs  # hidden_states, present, (attentions, cross_attentions)
+        return outputs  # (hidden_states, (cache_kv))
 
 
 class GPT2Model(nn.Module):
@@ -298,68 +219,49 @@ class GPT2Model(nn.Module):
         self,
         input_metadata: InputMetadata,
         input_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Dict[int, Tuple[Tuple[torch.Tensor]]]] = None,
+        past_key_values: Optional[Tuple[Tuple[torch.Tensor]]] = None,
         attention_mask: Optional[torch.FloatTensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-    ) -> Union[Tuple, BaseModelOutputWithPastAndCrossAttentions]:
-        # input_ids:(num_tokens)
+    ) -> Tuple[torch.Tensor, Tuple[Tuple[torch.Tensor, torch.Tensor], ...]]:
+        input_shape = input_ids.size()
+
         device = input_ids.device
 
         if past_key_values is None:
+            past_length = 0
             past_key_values = tuple([None] * len(self.h))
+        else:
+            past_length = past_key_values[0][0].size(-2)
+        if position_ids is None:
+            position_ids = torch.arange(past_length, input_shape[-1] + past_length, dtype=torch.long, device=device)
+            position_ids = position_ids.unsqueeze(0).view(-1, input_shape[-1])
 
+        inputs_embeds = self.wte(input_ids) # (num_tokens, embed)
+        position_embeds = self.wpe(position_ids) # (num_tokens, embed)
+        hidden_states = inputs_embeds + position_embeds # (num_tokens, embed)
 
-        inputs_embeds = self.wte(input_ids) #(num_tokens, embed)
-        position_embeds = self.wpe(position_ids) #(num_tokens, embed)
-        hidden_states = inputs_embeds + position_embeds #(num_tokens, embed)
+        output_shape = input_shape + (hidden_states.size(-1),)
 
-        input_shape = input_ids.size()
-        output_shape = input_shape + (hidden_states.size(-1),) #(num_tokens, embed)
+        presents = ()
 
-        presents = () if use_cache else None
         for i, (block, layer_past) in enumerate(zip(self.h, past_key_values)):
-
-            # Model parallel
-            if self.model_parallel:
-                torch.cuda.set_device(hidden_states.device)
-                # Ensure layer_past is on same device as hidden_states (might not be correct)
-                if layer_past is not None:
-                    layer_past = tuple(past_state.to(hidden_states.device) for past_state in layer_past)
-                # Ensure that attention_mask is always on the same device as hidden_states
-                if attention_mask is not None:
-                    attention_mask = attention_mask.to(hidden_states.device)
-
-
             outputs = block(
                 input_metadata,
                 hidden_states,
                 layer_past=layer_past,
                 attention_mask=attention_mask,
-                use_cache=use_cache,
             )
-
-            hidden_states = outputs[0]
-            if use_cache is True:
-                presents = presents + (outputs[1],)
-
-            # Model Parallel: If it's the last layer for that device, put things on the next device
-            if self.model_parallel:
-                for k, v in self.device_map.items():
-                    if i == v[-1] and "cuda:" + str(k) != self.last_device:
-                        hidden_states = hidden_states.to("cuda:" + str(k + 1))
+            hidden_states = outputs[0] # output: (hidden_states, (cache_k, cache_v))
+            presents = presents + (outputs[1],) # ((cache_k, cache_v), (cache_k, cache_v), ...)
 
         hidden_states = self.ln_f(hidden_states)
 
         hidden_states = hidden_states.view(output_shape)
 
-        return BaseModelOutputWithPastAndCrossAttentions(
-            last_hidden_state=hidden_states,
-            past_key_values=presents,
-        )
+        return (hidden_states, presents) #(hidden_states, presents)
 
 
 class GPT2LMHeadModel(nn.Module):
-
     def __init__(self, config):
         super().__init__()
         self.config = config
@@ -370,30 +272,23 @@ class GPT2LMHeadModel(nn.Module):
         self,
         input_metadata: InputMetadata,
         input_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Dict[int, Tuple[Tuple[torch.Tensor]]]] = None,
+        past_key_values: Optional[Tuple[Tuple[torch.Tensor]]] = None,
         attention_mask: Optional[torch.FloatTensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        use_cache: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-    ) -> Union[Tuple, CausalLMOutputWithCrossAttentions]:
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
+    ) -> Tuple[torch.Tensor, Tuple[Tuple[torch.Tensor, torch.Tensor], ...]]:
+        # input_ids : (num_tokens)
         transformer_outputs = self.transformer(
             input_metadata,
             input_ids,
             past_key_values=past_key_values,
             attention_mask=attention_mask,
             position_ids=position_ids,
-            use_cache=use_cache,
-            return_dict=return_dict,
         )
-        hidden_states = transformer_outputs[0]
+        hidden_states = transformer_outputs[0] # (num_tokens, embed)
 
-        lm_logits = self.lm_head(hidden_states)
+        lm_logits = self.lm_head(hidden_states) # (num_tokens, vocab_size)
 
-        return CausalLMOutputWithCrossAttentions(
-            logits=lm_logits,
-            past_key_values=transformer_outputs.past_key_values,
-        )
+        return (lm_logits, transformer_outputs[1]) # logits, cache_kvs
+
 
 

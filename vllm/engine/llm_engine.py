@@ -122,8 +122,8 @@ class LLMEngine:
                                     past_key_values = model_kwargs["past_key_values"],
                                     input_metadata = input_metadata)
         
-        model_kwargs["past_key_values"] = outputs.past_key_values
-        next_token_logits = outputs.logits[-1, :]
+        model_kwargs["past_key_values"] = outputs[1]
+        next_token_logits = outputs[0][-1, :]
         next_tokens = torch.argmax(next_token_logits, dim=-1)
 
         output: Dict[int, SequenceOutputs] = {}

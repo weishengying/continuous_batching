@@ -287,7 +287,7 @@ class GPT2LMHeadModel(nn.Module):
 
         lm_logits = self.lm_head(hidden_states)
 
-        return (lm_logits, transformer_outputs[1]) #(logits, cache_kvs)
+        return (lm_logits, transformer_outputs[1]) #logits, cache_kvs
 
 
 
