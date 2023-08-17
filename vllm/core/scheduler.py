@@ -161,6 +161,7 @@ class Scheduler:
             self.running.append(seq_group)
             num_batched_tokens += num_prompt_tokens
             prompt_group_ids.append(seq_group.request_id)
+            break # we alaways pop one waitting seq
 
         scheduler_outputs = SchedulerOutputs(
             blocks_to_swap_in=blocks_to_swap_in,

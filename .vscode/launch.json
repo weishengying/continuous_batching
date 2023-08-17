@@ -9,7 +9,7 @@
             "name": "Python: Current File",
             "type": "python",
             "request": "launch",
-            "program": "/mnt/weishengying/vllm_test/test.py",
+            "program": "/mnt/weishengying/continuous_batching/gpt2_model_test.py",
             "console": "integratedTerminal",
             "justMyCode": false,
             "python": "/opt/conda/envs/smoothquant/bin/python",

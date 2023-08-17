@@ -117,7 +117,10 @@ class LLMEngine:
         # Execute the model.
         tokens_tensor, positions_tensor, input_metadata = self._prepare_inputs(seq_group_metadata_list)
         
-        outputs = self.model.forward(input_ids = tokens_tensor, past_key_values = model_kwargs["past_key_values"])
+        outputs = self.model.forward(input_ids = tokens_tensor, 
+                                    position_ids = positions_tensor,
+                                    past_key_values = model_kwargs["past_key_values"],
+                                    input_metadata = input_metadata)
         
         model_kwargs["past_key_values"] = outputs.past_key_values
         next_token_logits = outputs.logits[-1, :]

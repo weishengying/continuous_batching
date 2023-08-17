@@ -1,4 +1,4 @@
-from gpt2_model import GPT2LMHeadModel
+from vllm.model_executor.models.gpt2_model import GPT2LMHeadModel
 from transformers import AutoConfig, AutoTokenizer
 import torch
 
@@ -26,7 +26,7 @@ def load_weight(model):
 load_weight(model)
 tokenizer = AutoTokenizer.from_pretrained('/mnt/weishengying/gpt2', trust_remote_code=True)
 
-prompt="Life is a fucking movie"
+prompt=["God is a girl"]
 # max_len = 50
 # input_ids = tokenizer(prompt, return_tensors="pt")['input_ids'].cuda()
 # while torch.numel(input_ids) < max_len:
@@ -47,14 +47,12 @@ cache_kv = None
 generate = input_ids
 while cnt < max_len:
     # forward step
-    output = model.forward(input_ids = input_ids, use_cache=True, past_key_values=cache_kv)
-    # cache_kv
-    cache_kv = output.past_key_values
+    output = model.forward(input_ids = input_ids, past_key_values=cache_kv) #(logits, cache_kvs)
     # greedy sample
-    next_token = torch.argmax(output.logits[:,-1,:], dim=-1)
-    if next_token == gpt2_config.eos_token_id: # eos_token
-        break
+    next_token = torch.argmax(output[0][:,-1,:], dim=-1)
     cnt += 1
+    # cache_kv
+    cache_kv = output[1]
     # concat output
     generate = torch.cat([generate, next_token[:, None]], dim=-1)
     # get last new token as input

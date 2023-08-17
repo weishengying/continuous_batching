@@ -4,7 +4,7 @@ from vllm.config import SchedulerConfig
 from transformers import AutoTokenizer, AutoConfig
 from vllm.sampling_params import SamplingParams
 
-from vllm.model_executor.models.gpt2_model import GPT2LMHeadModel
+from vllm.model_executor.models.gpt2 import GPT2LMHeadModel
 torch.manual_seed(10)
 
 gpt2_config = AutoConfig.from_pretrained('/mnt/weishengying/gpt2')
@@ -27,11 +27,11 @@ load_weight(model)
 
 tokenizer = AutoTokenizer.from_pretrained('/mnt/weishengying/gpt2', trust_remote_code=True)
 
-scheduler_config = SchedulerConfig(max_num_batched_tokens=512, max_num_seqs=4, max_model_len=50)
+scheduler_config = SchedulerConfig(max_num_batched_tokens=512, max_num_seqs=2, max_model_len=50)
 sampling_params = SamplingParams(temperature=0, max_tokens=512)
 llm = LLM(model=model, tokenizer=tokenizer, scheduler_config=scheduler_config, log_stats=False)
 
-prompt="Life is a fucking movie"
+prompt=["God is a girl", "Hello World"]
 outputs = llm.generate(prompt, sampling_params, use_tqdm=False)
 
 for output in outputs:
