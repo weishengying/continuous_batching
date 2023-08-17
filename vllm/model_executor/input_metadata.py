@@ -31,6 +31,7 @@ class InputMetadata:
         self.context_lens = context_lens
         self.max_context_len = max_context_len
 
+        self.sample_pos = {}
         self.num_prompts = len(prompt_lens)
         self.num_prompt_tokens = sum(prompt_lens)
         self.num_generation_tokens = context_lens.shape[0]

@@ -26,7 +26,7 @@ def load_weight(model):
 load_weight(model)
 tokenizer = AutoTokenizer.from_pretrained('/mnt/weishengying/gpt2', trust_remote_code=True)
 
-prompt=["God is a girl"]
+prompt=["Life is a movie"]
 # max_len = 50
 # input_ids = tokenizer(prompt, return_tensors="pt")['input_ids'].cuda()
 # while torch.numel(input_ids) < max_len:
@@ -40,7 +40,7 @@ prompt=["God is a girl"]
 #     input_ids = torch.cat([input_ids, next_token[:, None]], dim=-1)
 # print("output_text: ", tokenizer.batch_decode(input_ids.cpu().numpy()))
 
-max_len = 50
+max_len = 20
 cnt = 0
 input_ids = tokenizer(prompt, return_tensors="pt")['input_ids'].cuda()
 cache_kv = None

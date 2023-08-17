@@ -1,4 +1,4 @@
-from typing import Optional, Tuple, Union
+from typing import Optional, Tuple, Union, Dict, List
 from vllm.model_executor.input_metadata import InputMetadata
 import torch
 from torch import nn
@@ -91,7 +91,7 @@ class GPT2Attention(nn.Module):
 
         attn_output = torch.matmul(attn_weights, value)
 
-        return attn_output
+        return attn_output #(head, num_tokens, head_dim)
 
     def _split_heads(self, tensor, num_heads, attn_head_size):
         """
@@ -114,9 +114,9 @@ class GPT2Attention(nn.Module):
         self,
         input_metadata: InputMetadata,
         hidden_states: Optional[Tuple[torch.FloatTensor]],
-        layer_past: Optional[Tuple[torch.Tensor]] = None,
+        layer_past: Optional[Dict[int, Tuple[torch.Tensor]]] = None,
         attention_mask: Optional[torch.FloatTensor] = None,
-    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    ) -> Tuple[torch.Tensor, Dict[int, Tuple[torch.Tensor, torch.Tensor]]]:
         #q,k,v (num_tokens, embed)
         query, key, value = self.c_attn(hidden_states).split(self.split_size, dim=-1)
 
@@ -124,20 +124,47 @@ class GPT2Attention(nn.Module):
         key = self._split_heads(key, self.num_heads, self.head_dim) # (head, num_tokens, head_dim)
         value = self._split_heads(value, self.num_heads, self.head_dim) # (head, num_tokens, head_dim)
 
-        if layer_past is not None:
-            past_key, past_value = layer_past
-            key = torch.cat((past_key, key), dim=-2)
-            value = torch.cat((past_value, value), dim=-2)
+        # 按不同 seq_id 的 num_tokens 切分 q k v
+        present_qkv: Dict[int, List(torch.Tensor)] = {} # seq_id --> qkv
+        seq_ids = []
+        for seq_id, _ in input_metadata.seq_groups:
+            seq_ids.extend(seq_id)
+        kv_lens = []
+        for prompt_len in input_metadata.prompt_lens:
+            kv_lens.append(prompt_len)
+        for i in range(input_metadata.num_generation_tokens):
+            kv_lens.append(1)
+        assert len(seq_ids) == len(kv_lens)
+        
+        shift = 0
+        for seq_id, kv_len in zip(seq_ids, kv_lens):
+            present_qkv[seq_id] = [query[:, shift : shift + kv_len, :],
+                                    key[:, shift : shift + kv_len, :], 
+                                    value[:, shift : shift + kv_len, :]]
+            shift += kv_len
+            input_metadata.sample_pos[seq_id] = shift - 1
+        assert shift == query.size()[-2]
+        
+        for seq_id in seq_ids:
+            if layer_past[seq_id] is not None:
+                past_key, past_value = layer_past[seq_id]
+                present_qkv[seq_id][1] = torch.cat((past_key, present_qkv[seq_id][1]), dim=-2)
+                present_qkv[seq_id][2] = torch.cat((past_value, present_qkv[seq_id][2]), dim=-2)
 
-
-        cache_kv = (key, value)
-
-        attn_output = self._attn(query, key, value, attention_mask) # (head, num_tokens, head_dim)
+        atten_outputs = []
+        for seq_id in present_qkv.keys():
+            query, key, value = present_qkv[seq_id]
+            attn_output = self._attn(query, key, value, attention_mask) 
+            atten_outputs.append(attn_output)
+        attn_output = torch.cat(atten_outputs, dim=-2) # (head, num_tokens, head_dim)
 
         attn_output = self._merge_heads(attn_output, self.num_heads, self.head_dim)
         attn_output = self.c_proj(attn_output)
 
-        outputs = (attn_output, cache_kv)
+        present_kv: Dict[int, Tupe(torch.Tensor)] = {} 
+        for seq_id in present_qkv.keys():
+            present_kv[seq_id] = tuple(present_qkv[seq_id][1:])
+        outputs = (attn_output, present_kv)
 
         return outputs
 
@@ -186,9 +213,9 @@ class GPT2Block(nn.Module):
             hidden_states,
             layer_past=layer_past,
             attention_mask=attention_mask,
-        )
-        attn_output = attn_outputs[0] #(hidden_state, (cache_k, cache_v))
-        cache_kv = attn_outputs[1:]
+        ) #(hidden_state, dict(int, (cache_k_tensor, cache_v_tensor)))
+        attn_output = attn_outputs[0] 
+        cache_kv = attn_outputs[1]
         # residual connection
         hidden_states = attn_output + residual
 
@@ -198,9 +225,9 @@ class GPT2Block(nn.Module):
         # residual connection
         hidden_states = residual + feed_forward_hidden_states
 
-        outputs = (hidden_states,) + cache_kv
+        outputs = (hidden_states, cache_kv)
 
-        return outputs  # (hidden_states, (cache_kv))
+        return outputs
 
 
 class GPT2Model(nn.Module):
@@ -219,7 +246,7 @@ class GPT2Model(nn.Module):
         self,
         input_metadata: InputMetadata,
         input_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Tuple[Tuple[torch.Tensor]]] = None,
+        past_key_values: Optional[Dict[int, Tuple[Tuple[torch.Tensor]]]] = None,
         attention_mask: Optional[torch.FloatTensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
     ) -> Tuple[torch.Tensor, Tuple[Tuple[torch.Tensor, torch.Tensor], ...]]:
@@ -228,13 +255,19 @@ class GPT2Model(nn.Module):
         device = input_ids.device
 
         if past_key_values is None:
-            past_length = 0
-            past_key_values = tuple([None] * len(self.h))
-        else:
-            past_length = past_key_values[0][0].size(-2)
-        if position_ids is None:
-            position_ids = torch.arange(past_length, input_shape[-1] + past_length, dtype=torch.long, device=device)
-            position_ids = position_ids.unsqueeze(0).view(-1, input_shape[-1])
+            past_key_values = dict() # seq_id --> cache kv
+            
+        for seq_ids, _ in input_metadata.seq_groups:
+            assert len(seq_ids) == 1 # assert greedy sample
+            if seq_ids[0] not in list(past_key_values.keys()):
+                past_key_values[seq_ids[0]] = tuple([None] * len(self.h))
+
+        deleted_seq_id = []
+        for seq_id in past_key_values.keys():
+            if seq_id  not in input_metadata.seq_data.keys():
+                deleted_seq_id.append(seq_id)
+        for seq_id in deleted_seq_id:
+            del past_key_values[seq_id] # 删除已经完成的 seq 的 cache kv
 
         inputs_embeds = self.wte(input_ids) # (num_tokens, embed)
         position_embeds = self.wpe(position_ids) # (num_tokens, embed)
@@ -242,23 +275,29 @@ class GPT2Model(nn.Module):
 
         output_shape = input_shape + (hidden_states.size(-1),)
 
-        presents = ()
+        cache_kvs = dict() # seq_id --> cache kv
+        for seq_id in past_key_values.keys():
+            cache_kvs[seq_id] = ()
 
-        for i, (block, layer_past) in enumerate(zip(self.h, past_key_values)):
+        for i, block in enumerate(self.h):
+            layer_past = {}
+            for seq_id in past_key_values.keys():
+                layer_past[seq_id] = past_key_values[seq_id][i]
             outputs = block(
                 input_metadata,
                 hidden_states,
                 layer_past=layer_past,
                 attention_mask=attention_mask,
             )
-            hidden_states = outputs[0] # output: (hidden_states, (cache_k, cache_v))
-            presents = presents + (outputs[1],) # ((cache_k, cache_v), (cache_k, cache_v), ...)
+            hidden_states = outputs[0] # output: (hidden_states, cache_kv)
+            for seq_id in cache_kvs.keys():
+                cache_kvs[seq_id] = cache_kvs[seq_id] + (outputs[1][seq_id], ) # {seq_id : (cache_k, cache_v), (cache_k, cache_v), ...}
 
         hidden_states = self.ln_f(hidden_states)
 
         hidden_states = hidden_states.view(output_shape)
 
-        return (hidden_states, presents) #(hidden_states, presents)
+        return (hidden_states, cache_kvs) #(hidden_states, presents)
 
 
 class GPT2LMHeadModel(nn.Module):
@@ -272,10 +311,10 @@ class GPT2LMHeadModel(nn.Module):
         self,
         input_metadata: InputMetadata,
         input_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Tuple[Tuple[torch.Tensor]]] = None,
+        past_key_values: Optional[Dict[int, Tuple[Tuple[torch.Tensor]]]] = None,
         attention_mask: Optional[torch.FloatTensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-    ) -> Tuple[torch.Tensor, Tuple[Tuple[torch.Tensor, torch.Tensor], ...]]:
+    ) -> Tuple[torch.Tensor, Dict[int, Tuple[Tuple[torch.Tensor, torch.Tensor], ...]]]:
         # input_ids : (num_tokens)
         transformer_outputs = self.transformer(
             input_metadata,

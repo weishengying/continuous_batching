@@ -27,14 +27,18 @@ load_weight(model)
 
 tokenizer = AutoTokenizer.from_pretrained('/mnt/weishengying/gpt2', trust_remote_code=True)
 
-scheduler_config = SchedulerConfig(max_num_batched_tokens=512, max_num_seqs=2, max_model_len=50)
+scheduler_config = SchedulerConfig(max_num_batched_tokens=512, max_num_seqs=2, max_model_len=20)
 sampling_params = SamplingParams(temperature=0, max_tokens=512)
 llm = LLM(model=model, tokenizer=tokenizer, scheduler_config=scheduler_config, log_stats=False)
 
-prompt=["God is a girl"]
+prompt=["God is a girl",
+        "Hello World",
+        "Life is a movie",
+        ]
 outputs = llm.generate(prompt, sampling_params, use_tqdm=False)
 
 for output in outputs:
-    print(output.outputs[0].text)
+    print(f"request id:", output.request_id)
+    print(f"prompt: {output.prompt}, text: {output.outputs[0].text}")
 
 

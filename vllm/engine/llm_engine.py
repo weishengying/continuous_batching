@@ -123,13 +123,15 @@ class LLMEngine:
                                     input_metadata = input_metadata)
         
         model_kwargs["past_key_values"] = outputs[1]
-        next_token_logits = outputs[0][-1, :]
-        next_tokens = torch.argmax(next_token_logits, dim=-1)
 
+        # sample
         output: Dict[int, SequenceOutputs] = {}
         for seq_ids, _ in input_metadata.seq_groups:
             assert len(seq_ids) == 1
             seq_id = seq_ids[0]
+            pos = input_metadata.sample_pos[seq_id]
+            next_token_logits = outputs[0][pos, :]
+            next_tokens = torch.argmax(next_token_logits, dim=-1)
             output[seq_id] = SequenceOutputs(seq_id, seq_id, next_tokens.item(),None)
 
         # Update the scheduler with the model outputs.
