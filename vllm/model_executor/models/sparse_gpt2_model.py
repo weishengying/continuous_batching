@@ -4,7 +4,7 @@ import torch
 from torch import nn
 
 from .activations import ACT2FN
-
+import os
 class Conv1D(nn.Module):
     """
     1D-convolutional layer as defined by Radford et al. for OpenAI GPT (and also used in GPT-2).
@@ -22,7 +22,7 @@ class Conv1D(nn.Module):
         w = torch.empty(nx, nf)
         nn.init.normal_(w, std=0.02)
         self.weight = nn.Parameter(w)
-        self.bias = nn.Parameter(torch.zeros(nf))
+        self.bias = nn.Parameter(torch.empty(nf))
 
     def forward(self, x):
         size_out = x.size()[:-1] + (self.nf,)
@@ -73,10 +73,6 @@ class GPT2Attention(nn.Module):
 
         self.c_proj = Conv1D(self.embed_dim, self.embed_dim)
         # self.c_proj = get_lora_linear(self.embed_dim, self.embed_dim, config)
-
-
-        self.attn_dropout = nn.Dropout(config.attn_pdrop)
-        self.resid_dropout = nn.Dropout(config.resid_pdrop)
 
         self.pruned_heads = set()
 
@@ -252,18 +248,6 @@ class GPT2Attention(nn.Module):
         second_v_local = value[..., -remain_len:, :].contiguous().view(
             batch_size, num_head, -1, d_head)
 
-        mask_num_head = attention_mask.size(1)
-        mask_batch_size = attention_mask.size(0)
-        # (batch_size, num_head, 1, remain_len)
-        first_mask_local = attention_mask[..., -remain_len:]
-
-        # (batch_size, num_head, 1, global_num_blocks)
-        mask_stride = attention_mask[..., :query_len-(query_len % global_blocks_len)].contiguous().view(
-            mask_batch_size, mask_num_head, 1, -1, global_blocks_len)[..., -1]
-
-        # (batch_size, num_head, 1, num_global_blocks + remain_len)
-        second_mask = torch.cat((mask_stride, first_mask_local), dim=-1)
-
         # (batch_size, num_head, num_global_blocks, d_head)
         k_stride = key[..., :query_len-(query_len % global_blocks_len), :].contiguous().view(
             batch_size, num_head, -1, global_blocks_len, d_head)[:, :, :, -1, :]
@@ -276,11 +260,16 @@ class GPT2Attention(nn.Module):
 
         # (batch_size, num_head, 1, d_head)
         # (batch_size, num_head, remain_len, num_global_blocks + remain_len)
+        # print("second_q: ", second_q)
+        # print("second_k: ", second_k)
+        # print("second_v: ", second_v)
         attn_output, attn_weights = self._attn(query=second_q,
                                                key=second_k,
                                                value=second_v,
-                                               attention_mask=second_mask)
-
+                                               attention_mask=None)
+        # print("attn_output: ", attn_output)
+        # print("attn_weights: ", attn_weights)
+        # os._exit(1)
         return attn_output, None
 
     def _attn(self, query, key, value, attention_mask=None, head_mask=None):
@@ -298,19 +287,9 @@ class GPT2Attention(nn.Module):
 
         # (batch, head, seq_length, seq_length)
         attn_weights = torch.matmul(query, key.transpose(-1, -2))
+  
+        attn_weights = attn_weights / (value.size(-1) ** 0.5)
 
-        if self.scale_attn_weights:
-            attn_weights = attn_weights / (value.size(-1) ** 0.5)
-
-        # Layer-wise attention scaling
-        if self.scale_attn_by_inverse_layer_idx:
-            attn_weights = attn_weights / float(self.layer_idx + 1)
-
-        # if causal_mask is not None:
-        #     # if only "normal" attention layer implements causal mask
-        #     # query_length, key_length = query.size(-2), key.size(-2)
-        #     # causal_mask = self.bias[:, :, key_length - query_length : key_length, :key_length].bool()
-        #     attn_weights = torch.where(causal_mask, attn_weights, self.masked_bias.to(attn_weights.dtype))
 
         if attention_mask is not None:
             # Apply the attention mask
@@ -319,12 +298,8 @@ class GPT2Attention(nn.Module):
         attn_weights = nn.functional.softmax(attn_weights, dim=-1)
 
         # Downcast (if necessary) back to V's dtype (if in mixed-precision) -- No-Op otherwise
-        attn_weights = attn_weights.type(value.dtype)
-        attn_weights = self.attn_dropout(attn_weights)
+        # attn_weights = attn_weights.type(value.dtype)
 
-        # Mask heads if we want to
-        if head_mask is not None:
-            attn_weights = attn_weights * head_mask
 
         attn_output = torch.matmul(attn_weights, value)
 
@@ -373,7 +348,6 @@ class GPT2Attention(nn.Module):
         if attn_weights.dtype != torch.float32:
             raise RuntimeError("Error with upcasting, attn_weights does not have dtype torch.float32")
         attn_weights = attn_weights.type(value.dtype)
-        attn_weights = self.attn_dropout(attn_weights)
 
         # Mask heads if we want to
         if head_mask is not None:
@@ -434,7 +408,6 @@ class GPT2Attention(nn.Module):
 
         attn_output = self._merge_heads(attn_output, self.num_heads, self.head_dim)
         attn_output = self.c_proj(attn_output)
-        attn_output = self.resid_dropout(attn_output)
 
         outputs = (attn_output, present)
 
@@ -448,13 +421,11 @@ class GPT2MLP(nn.Module):
         self.c_fc = Conv1D(intermediate_size, embed_dim)
         self.c_proj = Conv1D(embed_dim, intermediate_size)
         self.act = ACT2FN[config.activation_function]
-        self.dropout = nn.Dropout(config.resid_pdrop)
 
     def forward(self, hidden_states: Optional[Tuple[torch.FloatTensor]]) -> torch.FloatTensor:
         hidden_states = self.c_fc(hidden_states)
         hidden_states = self.act(hidden_states)
         hidden_states = self.c_proj(hidden_states)
-        hidden_states = self.dropout(hidden_states)
         return hidden_states
 
 
@@ -547,7 +518,7 @@ class GPT2Model(nn.Module):
         output_shape = input_shape + (hidden_states.size(-1),)
 
         presents = ()
-
+        # hidden_states = self.ln_f(hidden_states)
         for i, (block, layer_past) in enumerate(zip(self.h, past_key_values)):
             outputs = block(
                 hidden_states,

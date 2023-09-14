@@ -4,7 +4,7 @@ from vllm.config import SchedulerConfig
 from transformers import AutoTokenizer, AutoConfig
 from vllm.sampling_params import SamplingParams
 
-from vllm.model_executor.models.gpt2 import GPT2LMHeadModel
+from vllm.model_executor.models.continuous_batch_gpt2 import GPT2LMHeadModel
 torch.manual_seed(10)
 
 gpt2_config = AutoConfig.from_pretrained('/mnt/weishengying/gpt2')
@@ -31,10 +31,8 @@ scheduler_config = SchedulerConfig(max_num_batched_tokens=512, max_num_seqs=2, m
 sampling_params = SamplingParams(temperature=0, max_tokens=512)
 llm = LLM(model=model, tokenizer=tokenizer, scheduler_config=scheduler_config, log_stats=False)
 
-prompt=["God is a girl",
-        "Hello World",
-        "Life is a movie",
-        ]
+prompt= ["A "*32,]
+
 outputs = llm.generate(prompt, sampling_params, use_tqdm=False)
 
 for output in outputs:
